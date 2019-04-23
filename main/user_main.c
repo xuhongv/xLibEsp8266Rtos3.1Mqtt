@@ -13,23 +13,26 @@
 #include "esp_err.h"
 #include "internal/esp_wifi_internal.h"
 #include "nvs_flash.h"
+#include "driver/gpio.h"
+#include "driver/pwm.h"
 #include "app_mqtt_handle.h"
 #include "rom/ets_sys.h"
 #include "driver/uart.h"
 
-#define MQTT_DATA_PUBLISH "$dp"
+#define MQTT_DATA_PUBLISH "devPub"
 #define MQTT_DATA_SUBLISH "devSub"
 static const char *TAG = "XuHongLog";
 static xQueueHandle userEventQueue = NULL;
 xTaskHandle xHandlerMqtt = NULL;
 
 int NetReconnect = 0, RunTime = 0;
-
+static uint8_t receiveEventEn = 0;
 typedef enum
 {
     EVENT_MQTT_NULL = 0,
     EVENT_MQTT_FISRT_RUN,
     EVENT_MQTT_CONNECT_SUCC,
+    EVENT_MQTT_CONNECTED,
     EVENT_MQTT_RECONNECT,
     EVENT_MQTT_HAS_NEW_MSG,
     EVENT_MQTT_UPLOAD_NETINFO,
@@ -42,16 +45,22 @@ void TaskXMqttStartConnect(void *p)
     uint8_t userEvent;
     ESP_LOGI(TAG, "xMqttReceiveMsg start");
 
-    userEventQueue = xQueueCreate(5, sizeof(uint8_t));
+    userEventQueue = xQueueCreate(10, sizeof(uint8_t));
+
     while (1)
     {
         if (xQueueReceive(userEventQueue, &userEvent, 10))
         {
-            //ESP_LOGI(TAG, "xQueueReceive userEventQueue %d \n", userEvent);
+            ESP_LOGI(TAG, "xQueueReceive userEventQueue %d \n", userEvent);
             switch (userEvent)
             {
+            case EVENT_MQTT_CONNECTED:
+                strcpy((char *)rMsg.topic, MQTT_DATA_SUBLISH);
+                rMsg.qos = 1;
+                xMqttSubTopic(&rMsg);
+                break;
             case EVENT_MQTT_HAS_NEW_MSG:
-                if (xMqttReceiveMsg(&rMsg))
+                while (xMqttReceiveMsg(&rMsg))
                 {
                     ESP_LOGI(TAG, "xMqttReceiveMsg clouds");
                     ESP_LOGI(TAG, "topic:\"%s\"", rMsg.topic);
@@ -60,17 +69,8 @@ void TaskXMqttStartConnect(void *p)
 
                     xMQTT_Msg msg;
                     strcpy((char *)msg.topic, MQTT_DATA_PUBLISH);
-
-                    uint8_t *tempS = &msg.payload[3];
-                    sprintf((char *)tempS, "{\"RSSI\":%d,\"xMqttVersion\":\"%s\",\"NetReconnect\":%d,\"RunTime\":%d,\"freeHeap\":%d}",
+                    sprintf((char *)msg.payload, "{\"RSSI\":%d,\"xMqttVersion\":%s,\"NetReconnect\":%d,\"RunTime\":%d,\"freeHeap\":%d}",
                             esp_wifi_get_ap_rssi(), getXMqttVersion(), NetReconnect, RunTime, esp_get_free_heap_size());
-
-                    msg.payload[0] = 0x03;
-                    msg.payload[1] = 0x00;
-                    msg.payload[2] = strlen((char *)tempS);
-
-                    // sprintf((char *)msg.payload, "{\"RSSI\":%d,\"xMqttVersion\":%s,\"NetReconnect\":%d,\"RunTime\":%d,\"freeHeap\":%d}",
-                    //         esp_wifi_get_ap_rssi(), getXMqttVersion(), NetReconnect, RunTime, esp_get_free_heap_size());
 
                     msg.payloadlen = msg.payload[2] + 3;
                     msg.qos = 1;
@@ -78,6 +78,7 @@ void TaskXMqttStartConnect(void *p)
                     msg.dup = 0;
                     xMqttPublicMsg(&msg);
                 }
+                receiveEventEn = 1;
                 break;
 
             default:
@@ -100,9 +101,9 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
         esp_err_t ret = 0;
         if (xHandlerMqtt == NULL)
         {
-            ret = xTaskCreate(TaskMainMqtt, "TaskMainMqtt", 1024 * 6, NULL, 10, &xHandlerMqtt);
-            vTaskDelay(1000 / portTICK_RATE_MS);
             ret = xTaskCreate(TaskXMqttStartConnect, "TaskXMqttStart", 1024 * 2, NULL, 8, NULL); // 创建任务
+            vTaskDelay(500 / portTICK_RATE_MS);
+            ret = xTaskCreate(TaskMainMqtt, "TaskMainMqtt", 1024 * 6, NULL, 10, &xHandlerMqtt);
         }
 
         if (!ret)
@@ -134,18 +135,24 @@ void funXMqtt_event_callback(xMQTT_EVENT event)
     {
     //连接成功回调
     case XP_MQTT_EVENT_MQTT_CONN_SUCC:
+
+        receiveEventEn = 1;
         ESP_LOGI(TAG, "funXMqtt_event_callback connect success");
+        userEvent = EVENT_MQTT_CONNECTED;
+        if (userEventQueue != NULL)
         {
-            xMQTT_Msg msg;
-            strcpy((char *)msg.topic, MQTT_DATA_SUBLISH);
-            msg.qos = 1;
-            xMqttSubTopic(&msg);
+            xQueueReset(userEventQueue);
+            xQueueSend(userEventQueue, &userEvent, 0);
         }
         break;
     //接收到新的消息下发
     case XP_MQTT_EVENT_RECEIVE_SUCC:
-        userEvent = EVENT_MQTT_HAS_NEW_MSG;
-        xQueueSend(userEventQueue, &userEvent, 0);
+        if (receiveEventEn == 1)
+        {
+            receiveEventEn = 0;
+            userEvent = EVENT_MQTT_HAS_NEW_MSG;
+            xQueueSend(userEventQueue, &userEvent, 0);
+        }
         break;
     //心跳回复
     case XP_MQTT_EVENT_HEART_BEAT:
@@ -278,12 +285,12 @@ void app_main(void)
     xMQTT_CONFIG xMqttConfig =
         {
             .MQTTVersion = 4,
-            .borkerHost = "www.baidu.com", //固定
-            .borkerPort = 1883,                //固定
+            .borkerHost = "www.xuhonys.cn", //固定
+            .borkerPort = 1883,             //固定
             .mqttCommandTimeout = 6000,
-            .username = "admin",       //产品id
-            .password = "b4e62d42a1f5", //鉴权信息
-            .clientID = "521331497",    //设备Id
+            .username = "admin",     //产品id
+            .password = "xuhong123", //鉴权信息
+            .clientID = "521331497", //设备Id
             .keepAliveInterval = 60,
             .cleansession = true,
             .xmqtt_event_callback = funXMqtt_event_callback,
@@ -293,6 +300,4 @@ void app_main(void)
     os_timer_disarm(&os_timer);
     os_timer_setfn(&os_timer, (os_timer_func_t *)(Task_pwm_blank), NULL);
     os_timer_arm(&os_timer, 1000, 1);
-
-    
 }
