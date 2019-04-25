@@ -15,75 +15,71 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "driver/pwm.h"
-#include "app_mqtt_handle.h"
+#include "xmqtt.h"
 #include "rom/ets_sys.h"
 #include "driver/uart.h"
 
-#define MQTT_DATA_PUBLISH "devPub"
-#define MQTT_DATA_SUBLISH "devSub"
+#define MQTT_DATA_PUBLISH "/a1EQVC8sNnR/48bf1822fde65a9a/UserOut"
+#define MQTT_DATA_SUBLISH "/a1EQVC8sNnR/48bf1822fde65a9a/UserIn"
 static const char *TAG = "XuHongLog";
-static xQueueHandle userEventQueue = NULL;
 xTaskHandle xHandlerMqtt = NULL;
 
-int NetReconnect = 0, RunTime = 0;
-static uint8_t receiveEventEn = 0;
-typedef enum
-{
-    EVENT_MQTT_NULL = 0,
-    EVENT_MQTT_FISRT_RUN,
-    EVENT_MQTT_CONNECT_SUCC,
-    EVENT_MQTT_CONNECTED,
-    EVENT_MQTT_RECONNECT,
-    EVENT_MQTT_HAS_NEW_MSG,
-    EVENT_MQTT_UPLOAD_NETINFO,
-} USER_EVENT;
-
-void TaskXMqttStartConnect(void *p)
+void TaskXMqttRecieve(void *p)
 {
 
     xMQTT_Msg rMsg;
-    uint8_t userEvent;
+    xMQTT_Msg sMsg;
     ESP_LOGI(TAG, "xMqttReceiveMsg start");
-
-    userEventQueue = xQueueCreate(10, sizeof(uint8_t));
-
     while (1)
     {
-        if (xQueueReceive(userEventQueue, &userEvent, 10))
+        if (xMqttReceiveMsg(&rMsg))
         {
-            ESP_LOGI(TAG, "xQueueReceive userEventQueue %d \n", userEvent);
-            switch (userEvent)
+            switch (rMsg.type)
             {
-            case EVENT_MQTT_CONNECTED:
+                //接收到新的消息下发
+            case xMQTT_TYPE_RECIEVE_MSG:
+                ESP_LOGI(TAG, "xQueueReceive topic: %s ", rMsg.topic);
+                ESP_LOGI(TAG, "xQueueReceive payload: %s", rMsg.payload);
+                ESP_LOGI(TAG, "esp_get_free_heap_size : %d \n", esp_get_free_heap_size());
+
+                strcpy((char *)sMsg.topic, MQTT_DATA_PUBLISH);
+                sprintf((char *)sMsg.payload, "{\"xMqttVersion\":%s,\"freeHeap\":%d}", getXMqttVersion(), esp_get_free_heap_size());
+                sMsg.payloadlen = strlen((char *)sMsg.payload);
+                sMsg.qos = 1;
+                sMsg.retained = 0;
+                sMsg.dup = 0;
+                xMqttPublicMsg(&sMsg);
+
+                break;
+                //连接Mqtt服务器成功
+            case xMQTT_TYPE_CONNECTED:
                 strcpy((char *)rMsg.topic, MQTT_DATA_SUBLISH);
                 rMsg.qos = 1;
                 xMqttSubTopic(&rMsg);
+                strcpy((char *)rMsg.topic, MQTT_DATA_PUBLISH);
+                rMsg.qos = 0;
+                xMqttSubTopic(&rMsg);
+                ESP_LOGI(TAG, "xMQTT : xMQTT_TYPE_CONNECTED");
                 break;
-            case EVENT_MQTT_HAS_NEW_MSG:
-                while (xMqttReceiveMsg(&rMsg))
-                {
-                    ESP_LOGI(TAG, "xMqttReceiveMsg clouds");
-                    ESP_LOGI(TAG, "topic:\"%s\"", rMsg.topic);
-                    ESP_LOGI(TAG, "payload[%d] : %s", rMsg.payloadlen, rMsg.payload);
-                    ESP_LOGI(TAG, "free heap size = %d\n", esp_get_free_heap_size());
-
-                    xMQTT_Msg msg;
-                    strcpy((char *)msg.topic, MQTT_DATA_PUBLISH);
-                    sprintf((char *)msg.payload, "{\"RSSI\":%d,\"xMqttVersion\":%s,\"NetReconnect\":%d,\"RunTime\":%d,\"freeHeap\":%d}",
-                            esp_wifi_get_ap_rssi(), getXMqttVersion(), NetReconnect, RunTime, esp_get_free_heap_size());
-
-                    msg.payloadlen = msg.payload[2] + 3;
-                    msg.qos = 1;
-                    msg.retained = 0;
-                    msg.dup = 0;
-                    xMqttPublicMsg(&msg);
-                }
-                receiveEventEn = 1;
+                //断开Mqtt服务器成功
+            case xMQTT_TYPE_DISCONNECTED:
+                ESP_LOGI(TAG, "xMQTT : xMQTT_TYPE_DISCONNECTED");
                 break;
-
+                //正在连接Mqtt服务器
+            case xMQTT_TYPE_CONNECTTING:
+                ESP_LOGI(TAG, "xMQTT : xMQTT_TYPE_CONNECTTING");
+                break;
+                //订阅主题成功
+            case xMQTT_TYPE_SUB_SUCCESS:
+                ESP_LOGI(TAG, "xMQTT : xMQTT_TYPE_SUB_SUCCESS");
+                break;
+                //ping心跳服务器
+            case xMQTT_TYPE_SEND_PING:
+                ESP_LOGI(TAG, "xMQTT : xMQTT_TYPE_SEND_PING");
+                break;
             default:
                 break;
-            };
+            }
         }
     }
 }
@@ -101,7 +97,7 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
         esp_err_t ret = 0;
         if (xHandlerMqtt == NULL)
         {
-            ret = xTaskCreate(TaskXMqttStartConnect, "TaskXMqttStart", 1024 * 2, NULL, 8, NULL); // 创建任务
+            ret = xTaskCreate(TaskXMqttRecieve, "TaskXMqttRecieve", 1024 * 2, NULL, 8, NULL); // 创建任务
             vTaskDelay(500 / portTICK_RATE_MS);
             ret = xTaskCreate(TaskMainMqtt, "TaskMainMqtt", 1024 * 6, NULL, 10, &xHandlerMqtt);
         }
@@ -125,104 +121,6 @@ static esp_err_t event_handler(void *ctx, system_event_t *event)
     return ESP_OK;
 }
 
-void funXMqtt_event_callback(xMQTT_EVENT event)
-{
-
-    uint8_t userEvent = EVENT_MQTT_NULL;
-
-    //ESP_LOGI(TAG, "funXMqtt_event_callback: %d", event);
-    switch (event)
-    {
-    //连接成功回调
-    case XP_MQTT_EVENT_MQTT_CONN_SUCC:
-
-        receiveEventEn = 1;
-        ESP_LOGI(TAG, "funXMqtt_event_callback connect success");
-        userEvent = EVENT_MQTT_CONNECTED;
-        if (userEventQueue != NULL)
-        {
-            xQueueReset(userEventQueue);
-            xQueueSend(userEventQueue, &userEvent, 0);
-        }
-        break;
-    //接收到新的消息下发
-    case XP_MQTT_EVENT_RECEIVE_SUCC:
-        if (receiveEventEn == 1)
-        {
-            receiveEventEn = 0;
-            userEvent = EVENT_MQTT_HAS_NEW_MSG;
-            xQueueSend(userEventQueue, &userEvent, 0);
-        }
-        break;
-    //心跳回复
-    case XP_MQTT_EVENT_HEART_BEAT:
-        ESP_LOGI(TAG, "funXMqtt_event_callback heartBeat");
-        {
-            // xMQTT_Msg msg;
-            // strcpy((char *)msg.topic, MQTT_DATA_PUBLISH);
-            // sprintf((char *)msg.payload, "{\"RSSI\":%d,\"xMqttVersion\":\"%s\",\"NetReconnect\":%d,\"RunTime\":%d,\"freeHeap\":%d}",
-            //         esp_wifi_get_ap_rssi(), getXMqttVersion(), NetReconnect, RunTime, esp_get_free_heap_size());
-            // msg.payloadlen = strlen((char *)msg.payload);
-            // msg.qos = 1;
-            // msg.retained = 0;
-            // msg.dup = 0;
-            // xMqttPublicMsg(&msg);
-
-            xMQTT_Msg msg;
-            strcpy((char *)msg.topic, MQTT_DATA_PUBLISH);
-
-            uint8_t *tempS = &msg.payload[3];
-            sprintf((char *)tempS, "{\"RSSI\":%d,\"xMqttVersion\":\"%s\",\"NetReconnect\":%d,\"RunTime\":%d,\"freeHeap\":%d}",
-                    esp_wifi_get_ap_rssi(), getXMqttVersion(), NetReconnect, RunTime, esp_get_free_heap_size());
-
-            msg.payload[0] = 0x03;
-            msg.payload[1] = 0x00;
-            msg.payload[2] = strlen((char *)tempS);
-
-            // sprintf((char *)msg.payload, "{\"RSSI\":%d,\"xMqttVersion\":%s,\"NetReconnect\":%d,\"RunTime\":%d,\"freeHeap\":%d}",
-            //         esp_wifi_get_ap_rssi(), getXMqttVersion(), NetReconnect, RunTime, esp_get_free_heap_size());
-
-            msg.payloadlen = msg.payload[2] + 3;
-            msg.qos = 1;
-            msg.retained = 0;
-            msg.dup = 0;
-            xMqttPublicMsg(&msg);
-        }
-        break;
-    //重连中
-    case XP_MQTT_EVENT_MQTT_CONNECTING:
-        ESP_LOGI(TAG, "funXMqtt_event_callback reConnect");
-        NetReconnect++;
-        break;
-    case XP_MQTT_EVENT_SUBMSG_SUCC:
-    {
-
-        xMQTT_Msg msg;
-        strcpy((char *)msg.topic, MQTT_DATA_PUBLISH);
-
-        uint8_t *tempS = &msg.payload[3];
-        sprintf((char *)tempS, "{\"RSSI\":%d,\"xMqttVersion\":\"%s\",\"NetReconnect\":%d,\"RunTime\":%d,\"freeHeap\":%d}",
-                esp_wifi_get_ap_rssi(), getXMqttVersion(), NetReconnect, RunTime, esp_get_free_heap_size());
-
-        msg.payload[0] = 0x03;
-        msg.payload[1] = 0x00;
-        msg.payload[2] = strlen((char *)tempS);
-
-        // sprintf((char *)msg.payload, "{\"RSSI\":%d,\"xMqttVersion\":%s,\"NetReconnect\":%d,\"RunTime\":%d,\"freeHeap\":%d}",
-        //         esp_wifi_get_ap_rssi(), getXMqttVersion(), NetReconnect, RunTime, esp_get_free_heap_size());
-
-        msg.payloadlen = msg.payload[2] + 3;
-        msg.qos = 1;
-        msg.retained = 0;
-        msg.dup = 0;
-        xMqttPublicMsg(&msg);
-    }
-    break;
-    default:
-        break;
-    }
-}
-
 static void initialise_wifi(void)
 {
     tcpip_adapter_init();
@@ -244,12 +142,6 @@ static void initialise_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-os_timer_t os_timer;
-void Task_pwm_blank(void)
-{
-    RunTime++;
-    //ESP_LOGI(TAG, "runtime : %d", RunTime);
-}
 /******************************************************************************
  * FunctionName : app_main
  * Description  : entry of user application, init user function here
@@ -285,19 +177,14 @@ void app_main(void)
     xMQTT_CONFIG xMqttConfig =
         {
             .MQTTVersion = 4,
-            .borkerHost = "www.xuhonys.cn", //固定
+            .borkerHost = "www.domino.cn", //固定
             .borkerPort = 1883,             //固定
             .mqttCommandTimeout = 6000,
             .username = "admin",     //产品id
-            .password = "xuhong123", //鉴权信息
+            .password = "xuhong", //鉴权信息
             .clientID = "521331497", //设备Id
             .keepAliveInterval = 60,
             .cleansession = true,
-            .xmqtt_event_callback = funXMqtt_event_callback,
         };
     xMqttInit(&xMqttConfig);
-
-    os_timer_disarm(&os_timer);
-    os_timer_setfn(&os_timer, (os_timer_func_t *)(Task_pwm_blank), NULL);
-    os_timer_arm(&os_timer, 1000, 1);
 }
