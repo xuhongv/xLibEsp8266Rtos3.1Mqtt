@@ -1,7 +1,7 @@
 
 ## `xMqttEsp8266Rtos3.1Lib`
 
-- 本仓库为 `esp8266 rtos 3.1` 环境的代码使用，如需拉取`esp32`请访问 https://github.com/xuhongv/xLibEsp32Rtos3.2Mqtt
+- 本仓库为 `esp8266 rtos 3.1` 环境的代码使用，如需拉取`esp32`代码请访问 https://github.com/xuhongv/xLibEsp32Rtos3.2Mqtt
 
 ----------
 ## 维护日志
